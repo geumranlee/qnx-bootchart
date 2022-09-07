@@ -1,0 +1,319 @@
+#!/bin/sh
+
+OPT_CAPTURE_MODE=2
+OPT_CAPTURE_TIME=10
+OPT_CAPTURE_TIME2=0
+OPT_INFINIT_CAP="off"
+OPT_PATH_LOG="/log/bootchart"
+TEMP_PATH="/log/bootchart/temp"
+PID_TEGRASTAT=""
+
+INCLUDE_PRE_DATA=""
+RELATIVE_TIMESTAMP=""
+
+
+set_log_path()
+{
+	rm -rf $OPT_PATH_LOG
+	mkdir $OPT_PATH_LOG
+	rm -rf $TEMP_PATH
+	mkdir $TEMP_PATH
+}
+
+cap_mem_info()
+{
+
+	cnt=0
+
+	while [ $cnt -lt $OPT_CAPTURE_TIME -o $OPT_INFINIT_CAP == "on" ]; do
+		page_count=`cat /proc/vm/stats | grep -e "^page_count" | cut -d'x' -f2 | cut -d' ' -f1`
+		pages_free=`cat /proc/vm/stats | grep -e "^pages_free" | cut -d'x' -f2 | cut -d' ' -f1`
+
+		page_count_dec=`echo $((0x${page_count}))`
+		pages_free_dec=`echo $((0x${pages_free}))`
+
+		(( total_mem_kb = page_count_dec*4096/1024 ))
+		(( avail_mem_kb = pages_free_dec*4096/1024 ))
+
+		echo "MemTotal: $total_mem_kb" >> $TEMP_PATH/proc_meminfo_total.log
+		echo "MemFree: $avail_mem_kb" >> $TEMP_PATH/proc_meminfo_free.log
+		echo $cnt > $TEMP_PATH/mem_info.log
+
+		(( cnt = cnt + 1 ))
+
+		sleep 1
+	done
+
+}
+
+gettime()
+{
+	cnt=0
+
+	if [ $OPT_CAPTURE_MODE == 2 ]; then
+		capture_start_time=`./gettime.out`
+	fi
+
+	while [ $cnt -lt $OPT_CAPTURE_TIME -o $OPT_INFINIT_CAP == "on" ]; do
+		if [ $OPT_CAPTURE_MODE == 2 ]; then
+			capture_time=`./gettime.out`
+			(( time_stamp = capture_time - capture_start_time ))
+			echo $time_stamp >> $TEMP_PATH/time.log
+		else
+			./gettime.out >> $TEMP_PATH/time.log
+		fi
+		echo "" >> $TEMP_PATH/space.log
+		(( cnt = cnt + 1 ))
+		sleep 1
+	done
+}
+
+# Start the boot logger.
+prog_start()
+{
+	echo ">>> bootchartd started"
+
+	gettime &
+	gettime_pid=$!
+	echo $gettime_pid > $TEMP_PATH/gettime_pid
+
+	#pidof tegrastats && exit 0
+	tegrastats --logfile $TEMP_PATH/tegrastats.log &
+	PID_TEGRASTAT=$!
+	echo $PID_TEGRASTAT > $TEMP_PATH/tegrastats_pid
+	#echo "bootchartd PID_TEGRASTAT=$PID_TEGRASTAT"
+
+	cap_mem_info &
+	mem_info_pid=$!
+	echo $mem_info_pid > $TEMP_PATH/mem_info_pid
+
+	#pidof bootchart-collector && exit 0
+	./bootchart-collector -m $OPT_CAPTURE_MODE -t $OPT_CAPTURE_TIME -o $OPT_PATH_LOG/taskstats.log &
+	if [ "$#" -gt 0 ]; then
+		$@
+		prog_stop
+	else
+		echo "no command passed, you need to manually stop the service sometime"
+	fi
+}
+
+prog_wait()
+{
+	echo "bootchartd wait $OPT_CAPTURE_TIME(sec)"
+	sleep $OPT_CAPTURE_TIME
+}
+
+# Stop boot logger and Extract the log data
+prog_stop()
+{
+
+	echo ">>> bootchartd stopped"
+	#tegrastats --stop
+	#kill -SIGKILL $PID_TEGRASTAT
+	kill -SIGKILL `cat $TEMP_PATH/tegrastats_pid`
+	kill -SIGKILL `cat $TEMP_PATH/gettime_pid`
+	kill -SIGKILL `cat $TEMP_PATH/mem_info_pid`
+
+	#only linux
+	#kill -n 9 `pidof bootchart-collector`
+	bootchart_pid=`ps -Ao comm,pid | grep bootchart-collector | tr -s " " | cut -d " " -f2`
+	kill -SIGKILL $bootchart_pid
+
+	cd $TEMP_PATH
+
+	num_of_gettime=`cat time.log | wc -l`
+
+	num_of_tegrastats=`cat tegrastats.log | wc -l`
+	while [ num_of_tegrastats -lt $num_of_gettime ]; do
+		dummy=`cat tegrastats.log | tail -n1`
+		echo $dummy >> tegrastats.log
+		num_of_tegrastats=`cat tegrastats.log | wc -l`
+	done
+
+	num_of_tegrastats=`cat tegrastats.log | wc -l`
+	while [ num_of_tegrastats -gt $num_of_gettime ]; do
+		sed -i '$ d' tegrastats.log
+		num_of_tegrastats=`cat tegrastats.log | wc -l`
+	done
+
+	num_of_meminfo=`cat mem_info.log`
+	while [ num_of_meminfo -lt $num_of_gettime ]; do
+		dummy=`cat tegrastats.log | tail -n1`
+		echo $dummy >> tegrastats.log
+		num_of_meminfo=`cat tegrastats.log | wc -l`
+	done
+
+	num_of_meminfo=`cat tegrastats.log | wc -l`
+	while [ num_of_meminfo -gt $num_of_gettime ]; do
+		sed -i '$ d' tegrastats.log
+		num_of_meminfo=`cat tegrastats.log | wc -l`
+	done
+
+	paste -d'\n' time.log tegrastats.log space.log >> $OPT_PATH_LOG/proc_stat.log
+	paste -d'\n' time.log proc_meminfo_total.log proc_meminfo_free.log space.log >> $OPT_PATH_LOG/proc_meminfo.log
+
+	cd $OPT_PATH_LOG
+	if [ ! -e header ]; then
+		echo "Can't find header in $OPT_PATH_LOG - aborting"
+		exit 1
+	fi
+
+	if [ ! -e proc_stat.log ]; then
+		echo "Can't find proc_stat.log in $OPT_PATH_LOG - aborting"
+		exit 1
+	fi
+
+	if [ ! -e proc_meminfo.log ]; then
+		echo "Can't find proc_meminfo.log in $OPT_PATH_LOG - aborting"
+		exit 1
+	fi
+
+	if [ ! -e taskstats.log ]; then
+		echo "Can't find taskstats.log in $OPT_PATH_LOG - aborting"
+		exit 1
+	fi
+	#tar -zcf ../bootchart.tgz *.log
+	rm -rf $TEMP_PATH
+}
+
+capture_data()
+{
+	prog_start
+	prog_wait
+	prog_stop
+}
+
+capture_oneshot()
+{
+	echo "bootchartd started(oneshot)"
+
+	./bootchart-collector -m $OPT_CAPTURE_MODE -t $OPT_CAPTURE_TIME -o $OPT_PATH_LOG/taskstats.log
+	echo "bootchartd started-end"
+}
+
+capture_header()
+{
+	sys_time=`date`
+	echo "title:Bootchart for QNX ($sys_time)" >> $OPT_PATH_LOG/header
+	cluster_version=`/usr/local/version.sh | grep "cluster version" | cut -d ":" -f2 | tr -d " "`
+	echo "cluster version:$cluster_version" >> $OPT_PATH_LOG/header
+	pidin info >> $OPT_PATH_LOG/header
+	echo "capture duration:$OPT_CAPTURE_TIME(sec)" >> $OPT_PATH_LOG/header
+	echo "e-mail:seokhoon.yoon@wewakecorp.com" >> $OPT_PATH_LOG/header
+}
+
+display_help()
+{
+	echo " bootchartd usage: $0 {start|stop}"
+	echo "  -to profile a running system, run:"
+	echo "   ./bootchartd start sleep 10"
+	echo "   ./bootchartd start; sleep 10; ./bootchartd stop;"
+	echo "   ./bootchartd -m 2 -t 10 start"
+	echo " bootchartd options:"
+	echo "  -m capture mode"
+	echo "     1: capture from boottime"
+	echo "     2: capture from bootchartd start time(default)"
+	echo "     3: capture after bootchartd start time and include boottime data"
+	echo "  -t capture time(sec)(default: 10sec)"
+	echo "  -o output log path(default: /log/bootchart)"
+}
+
+print_run_info()
+{
+	echo "=================================="
+	echo "OPT_CAPTURE_MODE=$OPT_CAPTURE_MODE"
+	echo "OPT_CAPTURE_TIME=$OPT_CAPTURE_TIME"
+	echo "OPT_CAPTURE_TIME2=$OPT_CAPTURE_TIME2"
+	echo "OPT_INFINIT_CAP=$OPT_INFINIT_CAP"
+	echo "OPT_PATH_LOG=$OPT_PATH_LOG"
+	echo "TEMP_PATH=$TEMP_PATH"
+	echo "PID_TEGRASTAT=$PID_TEGRASTAT"
+	echo "INCLUDE_PRE_DATA=$INCLUDE_PRE_DATA"
+	echo "RELATIVE_TIMESTAMP=$RELATIVE_TIMESTAMP"
+	echo "=================================="
+}
+
+#print_run_info
+
+while getopts "m:t:o:h" option
+do
+	case $option in
+		m)
+			OPT_CAPTURE_MODE=$OPTARG
+			;;
+		t)
+			OPT_CAPTURE_TIME=$OPTARG
+			OPT_CAPTURE_TIME2=$OPTARG
+			echo $OPT_CAPTURE_TIME
+			;;
+		o) OPT_PATH_LOG=$OPTARG/bootchart; TEMP_PATH=$OPTARG/bootchart/temp ;;
+		#h) display_help exit 1;;
+		h) display_help; exit 1 ;;
+	esac
+done
+shift $(expr $OPTIND - 1)
+
+remain_args=$#
+if [ $remain_args -eq 0 ]; then
+	command="none"
+else
+	command="$1"
+fi
+
+echo ">>> bootchartd setting"
+echo "start $command"
+if [ "$command" == "start" ]; then
+	if [ $remain_args -gt 2 ]; then
+		if [ $2 == "sleep" ]; then
+			OPT_CAPTURE_TIME=$3
+			OPT_INFINIT_CAP="off"
+			echo " -capture time: $OPT_CAPTURE_TIME(sec)"
+		fi
+	elif [ $OPT_CAPTURE_TIME2 -gt 0 ]; then
+		OPT_INFINIT_CAP="off"
+		echo " -capture time: $OPT_CAPTURE_TIME(sec)"
+	else
+		OPT_CAPTURE_TIME=0
+		OPT_INFINIT_CAP="on"
+	fi
+fi
+case $OPT_CAPTURE_MODE in
+	1) echo " -capture mode: bootchartd capture boottime data";;
+	2) echo " -capture mode: bootchartd capture after bootchartd start time";;
+	3) echo " -capture mode: bootchartd capture after bootchartd start time and include bottime data";;
+esac
+
+#echo " -capture time: $OPT_CAPTURE_TIME(sec)"
+echo " -log path: $OPT_PATH_LOG"
+
+#print_run_info
+
+if [ $OPT_CAPTURE_MODE == 1 ]; then
+	set_log_path
+	capture_header
+	capture_oneshot
+else
+	if [ $remain_args -eq 0 ]; then
+		set_log_path
+		capture_header
+		capture_data
+	else
+		case $command in
+			"start")
+				echo ">>> bootchartd start"
+				set_log_path
+				capture_header
+				if [ $OPT_CAPTURE_TIME2 -gt 0 ]; then
+					prog_start sleep $OPT_CAPTURE_TIME
+				else
+					shift
+					prog_start $@
+				fi
+				;;
+			"stop")
+				prog_stop
+				;;
+			*) exit;;
+		esac
+	fi
+fi
